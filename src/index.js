@@ -130,17 +130,6 @@ export function hasRootMarker(files) {
 }
 
 /**
- * Basic check to prevent IP/localhost targets
- */
-function isIpLiteral(host) {
-  // IPv4
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return true;
-  // IPv6 (very permissive)
-  if (/^\[?[0-9a-fA-F:]+\]?$/.test(host)) return true;
-  return false;
-}
-
-/**
  * Validate the provided remote URL against protocol and allowlist rules.
  * Returns { ok: true, parsedRemote, allowHosts } on success, otherwise
  * { ok: false, response } ready to return from the handler.
@@ -178,6 +167,17 @@ function validateUrl(remoteUrl, env) {
   }
 
   return { ok: true, parsedRemote, allowHosts };
+}
+
+/**
+ * Basic check to prevent IP/localhost targets
+ */
+function isIpLiteral(host) {
+  // IPv4
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return true;
+  // IPv6 (very permissive)
+  if (/^\[?[0-9a-fA-F:]+\]?$/.test(host)) return true;
+  return false;
 }
 
 /**
