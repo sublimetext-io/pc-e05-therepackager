@@ -38,7 +38,7 @@ Option B — Custom token (if you prefer explicit scopes)
 - Cloudflare Dashboard → My Profile → API Tokens → Create Token → Create Custom Token.
 - Scopes (minimum):
   - Account → Workers Scripts: Edit
-  - Account → Workers Routes: Edit
+  - Zone → Workers Routes: Edit
   - Zone → Zone: Read (limit to the `sublimetext.io` zone)
 - Resources: limit to the specific Account and the `sublimetext.io` Zone.
 - Create and copy the token value; store it as the `CLOUDFLARE_API_TOKEN` GitHub secret.
