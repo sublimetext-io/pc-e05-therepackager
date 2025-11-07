@@ -1,4 +1,5 @@
-import { unzipSync, zipSync } from "fflate";
+// repackage without decompression: parse central directory, strip a single root folder,
+// rebuild a new ZIP by rewriting headers and copying the *compressed* data as-is.
 
 export default {
   async fetch(request, env, ctx) {
@@ -10,124 +11,97 @@ export default {
       return new Response("Missing ?url", { status: 400 });
     }
 
-    // Security: validate and restrict remote URL
     const validation = validateUrl(remoteUrl, env);
     if (!validation.ok) return validation.response;
 
-    // Use Cloudflare edge cache
     const cacheKey = new Request(request.url, request);
     const cache = caches.default;
-    let response = await cache.match(cacheKey);
-    if (response) return response;
+    const cached = await cache.match(cacheKey);
+    if (cached) return addTiming(cached, "cache;desc=hit");
 
-    // Fetch upstream ZIP
-    const res = await fetch(remoteUrl);
-    // Enforce that the final URL still matches the allowlist (post-redirect)
+    // 1) HEAD pre-check for size → redirect if too large
+    const softLimit = Number(env?.MAX_ZIP_BYTES || 25_000_000);       // hard security cap
+    const cpuLimit = Number(env?.CPU_REPACKAGE_BYTES || 12_000_000);  // soft cap for CPU-budget
+    let head;
     try {
-      const finalHost = new URL(res.url || remoteUrl).hostname.toLowerCase();
+      head = await fetch(remoteUrl, { method: "HEAD" });
+    } catch {
+      // Some origins don’t like HEAD — fall back to GET path below.
+    }
+    const headLen = Number(head?.headers?.get("content-length") || 0);
+    if (head && head.ok) {
+      const finalHost = safeHost(head.url || remoteUrl);
       if (!validation.allowHosts.includes(finalHost)) {
         return new Response("Redirected host not permitted", { status: 403 });
       }
-    } catch {}
+      if (headLen && headLen > softLimit) {
+        return addTiming(Response.redirect(remoteUrl, 302), "reason;desc=size>hard");
+      }
+      if (headLen && headLen > cpuLimit) {
+        return addTiming(Response.redirect(remoteUrl, 302), "reason;desc=size>cpu");
+      }
+    }
+
+    // 2) GET with streaming cap; if we exceed limit → redirect (graceful).
+    const res = await fetch(remoteUrl);
+    const finalHost = safeHost(res.url || remoteUrl);
+    if (!validation.allowHosts.includes(finalHost)) {
+      return new Response("Redirected host not permitted", { status: 403 });
+    }
     if (!res.ok) {
       return new Response(`Upstream error: ${res.status}`, { status: 502 });
     }
-    // Limit download size to protect resources
-    const maxBytes = Number(env?.MAX_ZIP_BYTES || 25_000_000);
-    const data = await readLimited(res, maxBytes);
-    if (!data.ok) {
-      return new Response(data.message, { status: data.status });
+
+    const limited = await readLimited(res, softLimit);
+    if (!limited.ok) {
+      // hard limit → redirect rather than 413 (your requirement a)
+      return addTiming(Response.redirect(remoteUrl, 302), "reason;desc=readLimited");
     }
-    const arrayBuffer = data.body.buffer;
+    const bytes = limited.body; // Uint8Array
 
-    const files = unzipSync(new Uint8Array(arrayBuffer));
-    let zipped;
-    let useZipExtension;
-
-    if (shouldFlatten(files)) {
-      // Flatten the single root folder
-      const first = Object.keys(files)[0];
-      const prefix = first.split("/")[0] + "/";
-      const newFiles = {};
-
-      for (const [path, data] of Object.entries(files)) {
-        if (!path.startsWith(prefix)) continue;
-        const inner = path.slice(prefix.length);
-        if (inner) newFiles[inner] = data;
-      }
-
-      zipped = zipSync(newFiles);
-      useZipExtension = hasRootMarker(newFiles);
-    } else {
-      zipped = new Uint8Array(arrayBuffer);
-      useZipExtension = hasRootMarker(files);
+    // 3) Inspect ZIP central directory (no decompression) to decide flatten.
+    let toc;
+    try {
+      toc = parseZipTOC(bytes);
+    } catch (e) {
+      // If it isn’t a ZIP, just pass-through.
+      const passthru = buildDownloadResponse(bytes, name, "zip");
+      ctx.waitUntil(cache.put(cacheKey, passthru.clone()));
+      return addTiming(passthru, "path;desc=passthru-notzip");
     }
 
-    const extension = useZipExtension ? "zip" : "sublime-package";
-    const filename = `${name}.${extension}`;
+    const flatten = shouldFlattenFromTOC(toc);
+    const rootMarkerPresent =
+      hasRootMarkerInTOC(toc, flatten?.prefix ?? "");
 
-    response = new Response(zipped, {
-      headers: {
-        "Content-Type": "application/zip",
-        "Content-Disposition": `attachment; filename="${filename}"`,
-        "Cache-Control": "public, max-age=31536000, immutable"
-      }
-    });
+    if (!flatten) {
+      // No need to rewrite file names; just serve original as .sublime-package or .zip
+      const ext = rootMarkerPresent ? "zip" : "sublime-package";
+      const resp = buildDownloadResponse(bytes, name, ext);
+      ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+      return addTiming(resp, "path;desc=original-structure");
+    }
 
+    // 4) Lossless flatten (no inflate/deflate): rewrite headers + copy compressed data.
+    //    This keeps CPU tiny compared to unzip/rezip.
+    let flattenedBytes;
+    try {
+      flattenedBytes = rebuildZipFlatten(bytes, toc, flatten.prefix);
+    } catch (e) {
+      // If anything goes sideways, gracefully redirect upstream (a)
+      return addTiming(Response.redirect(remoteUrl, 302), "reason;desc=flatten-failed");
+    }
+
+    const ext = rootMarkerPresent ? "zip" : "sublime-package";
+    const response = buildDownloadResponse(flattenedBytes, name, ext);
     ctx.waitUntil(cache.put(cacheKey, response.clone()));
-    return response;
+    return addTiming(response, "path;desc=flatten-lossless");
   }
 };
 
-/**
- * Determine if the ZIP archive consists of exactly one top-level folder
- * containing all files (no other root-level files), making it safe to flatten.
- *
- * @param {Record<string, Uint8Array>} files - Map of archive paths to file data.
- * @returns {boolean} True if flattening should be applied.
- */
-export function shouldFlatten(files) {
-  const paths = Object.keys(files);
-  if (!paths.length) return false;
+// Named exports for tests
+export { parseZipTOC, shouldFlattenFromTOC, hasRootMarkerInTOC };
 
-  let root = null;
-  let hasNested = false;
-
-  for (const rawPath of paths) {
-    const path = rawPath.replace(/^\.\/+/g, "");
-    if (!path) continue;
-
-    const isDirectory = path.endsWith("/");
-    const clean = path.replace(/^\/+/, "").replace(/\/+$/, "");
-    if (!clean) continue;
-
-    const segments = clean.split("/");
-    const top = segments[0];
-
-    if (root === null) root = top;
-    if (top !== root) return false;
-
-    if (segments.length === 1 && !isDirectory) {
-      return false;
-    }
-
-    if (segments.length > 1) hasNested = true;
-  }
-
-  return hasNested;
-}
-
-/**
- * Check whether the archive contains a `.no-sublime-package` marker file at
- * the root level indicating it must be unpacked on the client.
- *
- * @param {Record<string, Uint8Array>} files - Map of archive paths to file data.
- * @returns {boolean} True when the marker exists at the root.
- */
-export function hasRootMarker(files) {
-  const markerPattern = /^(?:\.\/|\/)?\.no-sublime-package$/;
-  return Object.keys(files).some((rawPath) => markerPattern.test(rawPath));
-}
 
 /**
  * Validate the provided remote URL against protocol and allowlist rules.
@@ -222,4 +196,263 @@ async function readLimited(res, maxBytes) {
     offset += c.byteLength;
   }
   return { ok: true, body: out };
+}
+
+function safeHost(u) {
+  try { return new URL(u).hostname.toLowerCase(); } catch { return ""; }
+}
+
+function addTiming(resp, metric) {
+  const r = new Response(resp.body, resp);
+  const prev = resp.headers.get("Server-Timing");
+  r.headers.set("Server-Timing", prev ? `${prev}, ${metric}` : metric);
+  return r;
+}
+
+function buildDownloadResponse(bytes, name, ext) {
+  return new Response(bytes, {
+    headers: {
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="${name}.${ext}"`,
+      "Cache-Control": "public, max-age=31536000, immutable"
+    }
+  });
+}
+
+/* ===================== ZIP parsing & rebuilding ===================== */
+
+const SIG_EOCD = 0x06054b50;
+const SIG_CEN  = 0x02014b50;
+const SIG_LOC  = 0x04034b50;
+
+/**
+ * Parse a ZIP's central directory into a compact, non-inflating Table Of Contents (TOC).
+ *
+ * The parser scans from the end to locate the EOCD, iterates central directory
+ * file headers, and for each entry peeks at the corresponding local file header
+ * to compute the exact start offset of the compressed data. No file contents are
+ * decompressed.
+ *
+ * Returned data is intentionally minimal and tailored for downstream helpers:
+ * - shouldFlattenFromTOC(): decides if a single top-level directory can be stripped
+ * - hasRootMarkerInTOC(): detects a root-level ".no-sublime-package" marker
+ * - rebuildZipFlatten(): rewrites headers and copies compressed bytes as-is
+ *
+ * @param {Uint8Array} bytes - Full ZIP file bytes.
+ * @returns {{
+ *   entries: Array<{
+ *     name: string,
+ *     isDir: boolean,
+ *     flags: number,
+ *     method: number,
+ *     modTime: number,
+ *     modDate: number,
+ *     crc32: number,
+ *     compSize: number,
+ *     uncompSize: number,
+ *     locRelOffset: number,
+ *     dataStart: number
+ *   }>,
+ *   tops: Set<string>,           // unique first path segments at archive root
+ *   hasRootFiles: boolean        // true if any non-directory exists at root
+ * }}
+ * @throws {Error} If EOCD is not found or expected local headers are missing.
+ */
+function parseZipTOC(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  // Find EOCD within last 66k + comment
+  const maxScan = Math.min(bytes.byteLength, 0xFFFF + 22 + 1024);
+  let eocdOff = -1;
+  for (let i = bytes.byteLength - 22; i >= bytes.byteLength - maxScan; i--) {
+    if (i < 0) break;
+    if (view.getUint32(i, true) === SIG_EOCD) { eocdOff = i; break; }
+  }
+  if (eocdOff < 0) throw new Error("EOCD not found");
+
+  const totalEntries = view.getUint16(eocdOff + 10, true);
+  const cdSize       = view.getUint32(eocdOff + 12, true);
+  const cdOffset     = view.getUint32(eocdOff + 16, true);
+  const entries = [];
+
+  let p = cdOffset;
+  const decoder = new TextDecoder("utf-8");
+  for (let i = 0; i < totalEntries; i++) {
+    if (view.getUint32(p, true) !== SIG_CEN) break;
+
+    const versionNeeded  = view.getUint16(p + 6, true);
+    const flags          = view.getUint16(p + 8, true);
+    const method         = view.getUint16(p + 10, true);
+    const modTime        = view.getUint16(p + 12, true);
+    const modDate        = view.getUint16(p + 14, true);
+    const crc32          = view.getUint32(p + 16, true);
+    const compSize       = view.getUint32(p + 20, true);
+    const uncompSize     = view.getUint32(p + 24, true);
+    const fnameLen       = view.getUint16(p + 28, true);
+    const extraLen       = view.getUint16(p + 30, true);
+    const commentLen     = view.getUint16(p + 32, true);
+    const extAttrs       = view.getUint32(p + 36, true);
+    const locRelOffset   = view.getUint32(p + 42, true);
+
+    const nameBytes = bytes.subarray(p + 46, p + 46 + fnameLen);
+    const name = decoder.decode(nameBytes);
+
+    // Read local header to find data start (for copying compressed bytes)
+    const lp = locRelOffset;
+    if (view.getUint32(lp, true) !== SIG_LOC) throw new Error("LOC missing");
+    const lfNameLen  = view.getUint16(lp + 26, true);
+    const lfExtraLen = view.getUint16(lp + 28, true);
+    const dataStart  = lp + 30 + lfNameLen + lfExtraLen;
+
+    entries.push({
+      name,
+      isDir: name.endsWith("/"),
+      flags,
+      method,
+      modTime, modDate,
+      crc32, compSize, uncompSize,
+      locRelOffset,
+      dataStart
+    });
+
+    p += 46 + fnameLen + extraLen + commentLen;
+  }
+
+  // also gather top-level segments
+  const tops = new Set();
+  let hasRootFiles = false;
+  for (const e of entries) {
+    const parts = e.name.replace(/^\/+/, "").split("/").filter(Boolean);
+    if (parts.length === 0) continue;
+    tops.add(parts[0]);
+    if (!e.isDir && parts.length === 1) hasRootFiles = true;
+  }
+
+  return { entries, tops, hasRootFiles };
+}
+
+function shouldFlattenFromTOC(toc) {
+  // exactly one top-level folder and no root files → safe to flatten
+  if (toc.hasRootFiles) return false;
+  if (toc.tops.size !== 1) return false;
+  const [root] = toc.tops;
+  return { prefix: root + "/" };
+}
+
+function hasRootMarkerInTOC(toc, stripPrefix = "") {
+  const marker = ".no-sublime-package";
+  const want = stripPrefix ? (stripPrefix + marker) : marker;
+  for (const e of toc.entries) {
+    if (!e.isDir && e.name === want) return true;
+  }
+  return false;
+}
+
+function rebuildZipFlatten(bytes, toc, stripPrefix) {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder("utf-8");
+
+  const fileEntries = [];
+  for (const e of toc.entries) {
+    if (e.isDir) continue;
+    if (!e.name.startsWith(stripPrefix)) {
+      // Shouldn't happen if shouldFlattenFromTOC() said OK
+      throw new Error("entry outside prefix");
+    }
+    const newName = e.name.slice(stripPrefix.length);
+    if (!newName) continue; // was the directory marker itself
+    fileEntries.push({ ...e, newName });
+  }
+
+  // Build locals + remember offsets
+  const parts = [];
+  let offset = 0;
+  const locals = [];
+
+  for (const e of fileEntries) {
+    const nameBytes = encoder.encode(e.newName);
+    const utf8Flag = 1 << 11;
+    const noDataDesc = ~(1 << 3);
+
+    const flags = (e.flags | utf8Flag) & noDataDesc;
+    const locHeader = new Uint8Array(30 + nameBytes.length); // no extra
+    const v = new DataView(locHeader.buffer);
+
+    v.setUint32(0, SIG_LOC, true);
+    v.setUint16(4, 20, true);                // version needed
+    v.setUint16(6, flags, true);             // general purpose bit flag
+    v.setUint16(8, e.method, true);          // method (store/deflate)
+    v.setUint16(10, e.modTime, true);
+    v.setUint16(12, e.modDate, true);
+    v.setUint32(14, e.crc32, true);
+    v.setUint32(18, e.compSize, true);
+    v.setUint32(22, e.uncompSize, true);
+    v.setUint16(26, nameBytes.length, true);
+    v.setUint16(28, 0, true);                // extra length
+
+    locHeader.set(nameBytes, 30);
+
+    parts.push(locHeader);
+    offset += locHeader.length;
+
+    const data = bytes.subarray(e.dataStart, e.dataStart + e.compSize);
+    parts.push(data);
+    const localHeaderOffset = offset - locHeader.length; // where we wrote it
+    offset += data.length;
+
+    locals.push({ e, newName: e.newName, nameBytes, localHeaderOffset, flags });
+  }
+
+  // Central Directory
+  const cdStart = offset;
+  for (const x of locals) {
+    const { e, nameBytes, localHeaderOffset, flags } = x;
+    const cen = new Uint8Array(46 + nameBytes.length); // no extra, no comment
+    const v = new DataView(cen.buffer);
+
+    v.setUint32(0, SIG_CEN, true);
+    v.setUint16(4, 0x0314, true);           // version made by (3=Unix, 20)
+    v.setUint16(6, 20, true);               // version needed
+    v.setUint16(8, flags, true);
+    v.setUint16(10, e.method, true);
+    v.setUint16(12, e.modTime, true);
+    v.setUint16(14, e.modDate, true);
+    v.setUint32(16, e.crc32, true);
+    v.setUint32(20, e.compSize, true);
+    v.setUint32(24, e.uncompSize, true);
+    v.setUint16(28, nameBytes.length, true);
+    v.setUint16(30, 0, true);               // extra length
+    v.setUint16(32, 0, true);               // file comment length
+    v.setUint16(34, 0, true);               // disk number start
+    v.setUint16(36, 0, true);               // internal attrs
+    v.setUint32(38, 0, true);               // external attrs
+    v.setUint32(42, localHeaderOffset, true);
+
+    cen.set(nameBytes, 46);
+
+    parts.push(cen);
+    offset += cen.length;
+  }
+
+  const cdSize = offset - cdStart;
+
+  // EOCD
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, SIG_EOCD, true);
+  ev.setUint16(4, 0, true);                // disk number
+  ev.setUint16(6, 0, true);                // disk where CD starts
+  ev.setUint16(8, locals.length, true);    // records on this disk
+  ev.setUint16(10, locals.length, true);   // total records
+  ev.setUint32(12, cdSize, true);
+  ev.setUint32(16, cdStart, true);
+  ev.setUint16(20, 0, true);               // comment length
+
+  parts.push(eocd);
+  offset += eocd.length;
+
+  // concat
+  const out = new Uint8Array(offset);
+  let w = 0;
+  for (const p of parts) { out.set(p, w); w += p.length; }
+  return out;
 }

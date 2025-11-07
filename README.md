@@ -1,6 +1,6 @@
 # The Repackager
 
-The Repackager is a tiny Cloudflare Worker that fetches a remote ZIP archive, peels off the top-level folder, and returns a fresh ZIP (named after the requested package) that is ready to be installed as a Sublime Text `.sublime-package`. It uses the Workers edge cache to avoid recompressing the same source archive repeatedly.
+The Repackager is a tiny Cloudflare Worker that fetches a remote ZIP archive, peels off the top-level folder, and returns a ZIP (named after the requested package) that is ready to be installed as a Sublime Text `.sublime-package`. It uses the Workers edge cache to avoid processing the same source archive repeatedly.
 
 If the original ZIP contains the marker file `.no-sublime-package` at its root, the suggested filename extension will be `.zip`.  In that case installing the file under "Installed Packages" would not work and users must unzip the file manually into their "Packages" folder.
 

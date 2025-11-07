@@ -2,79 +2,85 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { unzipSync } from "fflate";
-import worker, { hasRootMarker, shouldFlatten } from "./index.js";
+import worker, { parseZipTOC, hasRootMarkerInTOC, shouldFlattenFromTOC } from "./index.js";
 
 const fixturePath = (name) => path.resolve("test/fixtures", name);
 const readFixture = (name) => fs.readFileSync(fixturePath(name));
-const unzipFixture = (name) => unzipSync(new Uint8Array(readFixture(name)));
 const originalFetch = globalThis.fetch;
 const originalCaches = globalThis.caches;
 
-describe("shouldFlatten", () => {
-  const empty = new Uint8Array();
-
-  it("returns true when archive has a single root folder", () => {
-    const result = shouldFlatten({
-      "plugin/": empty,
-      "plugin/main.py": empty,
-      "plugin/assets/icon.png": empty
-    });
-
-    expect(result).toBe(true);
+describe("shouldFlattenFromTOC", () => {
+  it("returns prefix when archive has a single root folder", () => {
+    const toc = {
+      entries: [
+        { name: "plugin/", isDir: true },
+        { name: "plugin/main.py", isDir: false },
+        { name: "plugin/assets/icon.png", isDir: false }
+      ],
+      tops: new Set(["plugin"]),
+      hasRootFiles: false
+    };
+    const result = shouldFlattenFromTOC(toc);
+    expect(result).toEqual({ prefix: "plugin/" });
   });
 
   it("returns false when root contains files", () => {
-    const result = shouldFlatten({
-      "main.py": empty,
-      "readme.txt": empty
-    });
-
-    expect(result).toBe(false);
+    const toc = {
+      entries: [
+        { name: "main.py", isDir: false },
+        { name: "readme.txt", isDir: false }
+      ],
+      tops: new Set(["main.py", "readme.txt"]),
+      hasRootFiles: true
+    };
+    expect(shouldFlattenFromTOC(toc)).toBe(false);
   });
 
   it("returns false when multiple root folders exist", () => {
-    const result = shouldFlatten({
-      "plugin/main.py": empty,
-      "other/file.txt": empty
-    });
-
-    expect(result).toBe(false);
+    const toc = {
+      entries: [
+        { name: "plugin/main.py", isDir: false },
+        { name: "other/file.txt", isDir: false }
+      ],
+      tops: new Set(["plugin", "other"]),
+      hasRootFiles: false
+    };
+    expect(shouldFlattenFromTOC(toc)).toBe(false);
   });
 });
 
-describe("hasRootMarker", () => {
-  const empty = new Uint8Array();
-
+describe("hasRootMarkerInTOC", () => {
   it("detects marker at root", () => {
-    expect(hasRootMarker({ ".no-sublime-package": empty })).toBe(true);
+    const toc = { entries: [{ name: ".no-sublime-package", isDir: false }] };
+    expect(hasRootMarkerInTOC(toc)).toBe(true);
   });
 
-  it("detects marker with leading dot slash", () => {
-    expect(hasRootMarker({ "./.no-sublime-package": empty })).toBe(true);
+  it("ignores marker nested in subdirectory without strip", () => {
+    const toc = { entries: [{ name: "nested/.no-sublime-package", isDir: false }] };
+    expect(hasRootMarkerInTOC(toc)).toBe(false);
   });
 
-  it("ignores marker nested in subdirectory", () => {
-    expect(hasRootMarker({ "nested/.no-sublime-package": empty })).toBe(false);
+  it("detects marker nested in subdirectory when stripping prefix", () => {
+    const toc = { entries: [{ name: "nested/.no-sublime-package", isDir: false }] };
+    expect(hasRootMarkerInTOC(toc, "nested/")).toBe(true);
   });
 });
 
 describe("real package fixtures", () => {
   it("MaxPane: flattens and uses .sublime-package", () => {
-    const files = unzipFixture("MaxPane-master.zip");
-
-    expect(shouldFlatten(files)).toBe(true);
-
-    const flattened = flattenFiles(files);
-    expect(hasRootMarker(flattened)).toBe(false);
+    const bytes = new Uint8Array(readFixture("MaxPane-master.zip"));
+    const toc = parseZipTOC(bytes);
+    const flatten = shouldFlattenFromTOC(toc);
+    expect(flatten).toBeTruthy();
+    expect(hasRootMarkerInTOC(toc, flatten.prefix)).toBe(false);
   });
 
   it("TreeSitter: flattens and uses .zip", () => {
-    const files = unzipFixture("TreeSitter-1.8.1.zip");
-
-    expect(shouldFlatten(files)).toBe(true);
-
-    const flattened = flattenFiles(files);
-    expect(hasRootMarker(flattened)).toBe(true);
+    const bytes = new Uint8Array(readFixture("TreeSitter-1.8.1.zip"));
+    const toc = parseZipTOC(bytes);
+    const flatten = shouldFlattenFromTOC(toc);
+    expect(flatten).toBeTruthy();
+    expect(hasRootMarkerInTOC(toc, flatten.prefix)).toBe(true);
   });
 });
 
@@ -139,7 +145,7 @@ describe("fetch handler", () => {
 
     const archive = unzipSync(new Uint8Array(await response.arrayBuffer()));
     expect(archive).toHaveProperty("max_pane.py");
-    expect(hasRootMarker(archive)).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(archive, ".no-sublime-package")).toBe(false);
   });
 
   it("returns a flattened .zip archive when marker present", async () => {
@@ -172,7 +178,7 @@ describe("fetch handler", () => {
     const archive = unzipSync(new Uint8Array(await response.arrayBuffer()));
     expect(archive).toHaveProperty("load.py");
     expect(archive).toHaveProperty("src/build.py");
-    expect(hasRootMarker(archive)).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(archive, ".no-sublime-package")).toBe(true);
   });
 
   it("rejects non-allowlisted host", async () => {
@@ -209,22 +215,6 @@ describe("fetch handler", () => {
     expect(response.status).toBe(400);
   });
 });
-
-function flattenFiles(files) {
-  const first = Object.keys(files)[0];
-  const prefix = first.split("/")[0] + "/";
-  const flattened = {};
-
-  for (const [path, data] of Object.entries(files)) {
-    if (!path.startsWith(prefix)) continue;
-    const inner = path.slice(prefix.length);
-    if (inner) {
-      flattened[inner] = data;
-    }
-  }
-
-  return flattened;
-}
 
 function createFetchMock(url, file) {
   return vi.fn(async (input) => {

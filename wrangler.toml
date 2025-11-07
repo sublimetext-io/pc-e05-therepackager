@@ -14,3 +14,5 @@ enabled = true
 ALLOW_HOSTS = "codeload.github.com,bitbucket.org,codelab.org,gitlab.com"
 # Maximum upstream ZIP size in bytes (default 25MB if unset)
 MAX_ZIP_BYTES = "25000000"
+# Maximum upstream ZIP size to prevent CPU burn
+CPU_REPACKAGE_BYTES="15000000"

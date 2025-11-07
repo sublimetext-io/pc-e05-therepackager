@@ -9,9 +9,9 @@
     "test": "vitest"
   },
   "dependencies": {
-    "fflate": "^0.8.2"
   },
   "devDependencies": {
+    "fflate": "^0.8.2",
     "vitest": "^4.0.2",
     "wrangler": "^4.43.0"
   }
