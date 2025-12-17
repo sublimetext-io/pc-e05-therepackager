@@ -11,6 +11,22 @@ export default {
     const pathname = url.pathname || "/";
     const remoteUrl = url.searchParams.get("url");
 
+    if (pathname === "/logs.json") {
+      const assetUrl =
+        env?.ASSET_URL ||
+        "https://github.com/packagecontrol/thecrawl/releases/download/crawler-status/logs.json";
+
+      const upstream = await fetch(assetUrl, {
+        // Keep edge cache tiny; still allow edge to revalidate quickly.
+        cf: { cacheTtl: 10, cacheEverything: true }
+      });
+
+      let response = new Response(upstream.body, upstream);
+      response.headers.set("Access-Control-Allow-Origin", "*");
+      response.headers.set("Cache-Control", "public, max-age=10, s-maxage=10");
+      return response;
+    }
+
     const packageMatch = pathname.match(/^\/packages\/([^/]+)\/?$/);
     if (packageMatch) {
       if (!remoteUrl) return new Response("Missing ?url", { status: 400 });

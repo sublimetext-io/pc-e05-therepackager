@@ -291,6 +291,32 @@ describe("fetch handler", () => {
 
     expect(response.status).toBe(200);
   });
+
+  it("proxies logs.json with short cache and CORS", async () => {
+    const assetUrl = "https://github.com/packagecontrol/thecrawl/releases/download/crawler-status/logs.json";
+    const payload = new TextEncoder().encode('{"ok":true}');
+
+    globalThis.fetch = vi.fn(async (input, init) => {
+      if (input === assetUrl) {
+        return new Response(payload, { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    });
+
+    const request = new Request("https://worker.example/logs.json");
+    const waitUntil = vi.fn();
+
+    const response = await worker.fetch(request, {}, { waitUntil });
+
+    expect(globalThis.fetch).toHaveBeenCalledWith(assetUrl, expect.objectContaining({
+      cf: expect.objectContaining({ cacheTtl: 10, cacheEverything: true })
+    }));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(response.headers.get("Cache-Control")).toContain("max-age=10");
+    const text = await response.text();
+    expect(text).toContain('"ok":true');
+  });
 });
 
 function createFetchMock(url, file) {
