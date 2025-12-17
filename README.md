@@ -51,15 +51,19 @@ npm run test -- run
 
 ## Deploy to Cloudflare
 
+Production deploys are automatic via the GitHub Actions workflow—pushing to the main branch is enough to publish.
+
+Local/manual deploy (useful for testing changes from your machine or targeting a different account):
+
 1. Authenticate once with `npx wrangler login` (or set `CLOUDFLARE_API_TOKEN` in your environment).
-2. Update `wrangler.toml` if you need a different worker name or other account-specific settings.
-3. Publish the worker:
+2. Update `wrangler.toml` if you need a different worker name or account-specific settings.
+3. Push a test build:
 
    ```bash
    npm run deploy
    ```
 
-Wrangler will upload the bundled worker to your Cloudflare account. After the command completes, the printed URL is ready to serve requests like the example above.
+Wrangler will upload the bundled worker to your Cloudflare account and print the URL for immediate testing.
 
 ## Troubleshooting
 
