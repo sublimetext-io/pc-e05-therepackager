@@ -17,8 +17,23 @@ If the original ZIP contains the marker file `.no-sublime-package` at its root, 
 
   Example:
 
+  http://localhost:8787/packages/USFM%20Bible?url=https://codeload.github.com/michaelblyons/SublimeSyntax-USFM-Bible/zip/version/st3092/0.1.0
+
+  The legacy root handler `/` is still available during migration:
+
   http://localhost:8787/?url=https://codeload.github.com/michaelblyons/SublimeSyntax-USFM-Bible/zip/version/st3092/0.1.0&name=USFM%20Bible
 
+## Endpoints
+
+- `/packages/<name>?url=<encoded remote zip>` (preferred): path segment supplies the package name; spaces can be URL-encoded. A trailing slash after `<name>` is accepted.
+- `/` (legacy): `?url=` and optional `&name=`.
+- `/logs.json`: small proxy to `ASSET_URL` (or default GitHub logs.json) with CORS `*` and a short cache (`max-age=10, s-maxage=10`).
+
+## Configuration
+
+- `ALLOW_HOSTS` (comma-separated) to limit allowed source hosts.
+- `MAX_ZIP_BYTES` and `CPU_REPACKAGE_BYTES` to cap input size.
+- `ASSET_URL` to override the `logs.json` proxy target.
 
 ## Run Tests
 
