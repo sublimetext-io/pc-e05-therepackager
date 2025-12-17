@@ -124,7 +124,7 @@ describe("fetch handler", () => {
     );
 
     const request = new Request(
-      `https://worker.example/?url=${encodeURIComponent(remoteUrl)}&name=MaxPane`
+      `https://worker.example/packages/MaxPane?url=${encodeURIComponent(remoteUrl)}`
     );
     const waitUntil = vi.fn();
 
@@ -156,7 +156,7 @@ describe("fetch handler", () => {
     );
 
     const request = new Request(
-      `https://worker.example/?url=${encodeURIComponent(remoteUrl)}&name=TreeSitter`
+      `https://worker.example/packages/TreeSitter?url=${encodeURIComponent(remoteUrl)}`
     );
     const waitUntil = vi.fn();
 
@@ -186,7 +186,7 @@ describe("fetch handler", () => {
     globalThis.fetch = createFetchMock(remoteUrl, new Uint8Array([1, 2, 3]));
 
     const request = new Request(
-      `https://worker.example/?url=${encodeURIComponent(remoteUrl)}&name=X`
+      `https://worker.example/packages/X?url=${encodeURIComponent(remoteUrl)}`
     );
     const waitUntil = vi.fn();
 
@@ -195,14 +195,52 @@ describe("fetch handler", () => {
       { ALLOW_HOSTS: "codeload.github.com" },
       { waitUntil }
     );
-
     expect(response.status).toBe(403);
+  });
+
+  it("requires package name in the /packages route", async () => {
+    const remoteUrl = "https://codeload.github.com/example/example/zip/master";
+    globalThis.fetch = createFetchMock(remoteUrl, new Uint8Array([1, 2, 3]));
+
+    const request = new Request(`https://worker.example/packages?url=${encodeURIComponent(remoteUrl)}`);
+    const waitUntil = vi.fn();
+
+    const response = await worker.fetch(
+      request,
+      { ALLOW_HOSTS: "codeload.github.com" },
+      { waitUntil }
+    );
+
+    expect(response.status).toBe(400);
+  });
+
+  it("keeps legacy root handler working during migration", async () => {
+    const remoteUrl = "https://codeload.github.com/jisaacks/MaxPane/zip/master";
+    globalThis.fetch = createFetchMock(
+      remoteUrl,
+      readFixture("MaxPane-master.zip")
+    );
+
+    const request = new Request(
+      `https://worker.example/?url=${encodeURIComponent(remoteUrl)}&name=MaxPane`
+    );
+    const waitUntil = vi.fn();
+
+    const response = await worker.fetch(
+      request,
+      { ALLOW_HOSTS: "codeload.github.com", MAX_ZIP_BYTES: "50000000" },
+      { waitUntil }
+    );
+
+    expect(response.status).toBe(200);
+    const contentDisposition = response.headers.get("Content-Disposition");
+    expect(contentDisposition).toContain('filename="MaxPane.sublime-package"');
   });
 
   it("rejects http scheme", async () => {
     const remoteUrl = "http://codeload.github.com/whatever.zip";
     const request = new Request(
-      `https://worker.example/?url=${encodeURIComponent(remoteUrl)}&name=X`
+      `https://worker.example/packages/X?url=${encodeURIComponent(remoteUrl)}`
     );
     const waitUntil = vi.fn();
 
@@ -213,6 +251,45 @@ describe("fetch handler", () => {
     );
 
     expect(response.status).toBe(400);
+  });
+
+  it("decodes package names with spaces from the path", async () => {
+    const remoteUrl = "https://codeload.github.com/example/example/zip/master";
+    globalThis.fetch = createFetchMock(remoteUrl, new Uint8Array([1, 2, 3]));
+
+    const request = new Request(
+      "https://worker.example/packages/Save%20All%20New%20Tabs%20to%20One%20File?url=" +
+        encodeURIComponent(remoteUrl)
+    );
+    const waitUntil = vi.fn();
+
+    const response = await worker.fetch(
+      request,
+      { ALLOW_HOSTS: "codeload.github.com" },
+      { waitUntil }
+    );
+
+    const cd = response.headers.get("Content-Disposition");
+    expect(cd).toContain('filename="Save All New Tabs to One File.zip"');
+  });
+
+  it("accepts trailing slash after package name", async () => {
+    const remoteUrl = "https://codeload.github.com/example/example/zip/master";
+    globalThis.fetch = createFetchMock(remoteUrl, new Uint8Array([1, 2, 3]));
+
+    const request = new Request(
+      "https://worker.example/packages/Save%20All%20New%20Tabs%20to%20One%20File/?url=" +
+        encodeURIComponent(remoteUrl)
+    );
+    const waitUntil = vi.fn();
+
+    const response = await worker.fetch(
+      request,
+      { ALLOW_HOSTS: "codeload.github.com" },
+      { waitUntil }
+    );
+
+    expect(response.status).toBe(200);
   });
 });
 
