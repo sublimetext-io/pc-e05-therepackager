@@ -292,13 +292,20 @@ describe("fetch handler", () => {
     expect(response.status).toBe(200);
   });
 
-  it("proxies logs.json with short cache and CORS", async () => {
+  it("proxies logs.json as compressible JSON with short cache and CORS", async () => {
     const assetUrl = "https://github.com/packagecontrol/thecrawl/releases/download/crawler-status/logs.json";
     const payload = new TextEncoder().encode('{"ok":true}');
 
     globalThis.fetch = vi.fn(async (input, init) => {
       if (input === assetUrl) {
-        return new Response(payload, { status: 200 });
+        return new Response(payload, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": String(payload.byteLength),
+            "Content-Disposition": "attachment; filename=logs.json"
+          }
+        });
       }
       return new Response(null, { status: 404 });
     });
@@ -314,8 +321,65 @@ describe("fetch handler", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
     expect(response.headers.get("Cache-Control")).toContain("max-age=10");
+    expect(response.headers.get("Content-Type")).toBe("application/json; charset=utf-8");
+    expect(response.headers.has("Content-Length")).toBe(false);
+    expect(response.headers.has("Content-Disposition")).toBe(false);
     const text = await response.text();
     expect(text).toContain('"ok":true');
+  });
+
+  it("returns 304 for logs.json when client ETag is fresh", async () => {
+    const assetUrl = "https://github.com/packagecontrol/thecrawl/releases/download/crawler-status/logs.json";
+
+    globalThis.fetch = vi.fn(async (input) => {
+      if (input === assetUrl) {
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: {
+            "ETag": '"abc"',
+            "Last-Modified": "Mon, 08 Jun 2026 06:25:03 GMT"
+          }
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+
+    const request = new Request("https://worker.example/logs.json", {
+      headers: { "If-None-Match": 'W/"abc"' }
+    });
+
+    const response = await worker.fetch(request, {}, { waitUntil: vi.fn() });
+
+    expect(response.status).toBe(304);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(response.headers.get("ETag")).toBe('"abc"');
+    expect(await response.text()).toBe("");
+  });
+
+  it("returns 304 for logs.json when client Last-Modified is fresh", async () => {
+    const assetUrl = "https://github.com/packagecontrol/thecrawl/releases/download/crawler-status/logs.json";
+
+    globalThis.fetch = vi.fn(async (input) => {
+      if (input === assetUrl) {
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: {
+            "Last-Modified": "Mon, 08 Jun 2026 06:25:03 GMT"
+          }
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+
+    const request = new Request("https://worker.example/logs.json", {
+      headers: { "If-Modified-Since": "Mon, 08 Jun 2026 06:25:04 GMT" }
+    });
+
+    const response = await worker.fetch(request, {}, { waitUntil: vi.fn() });
+
+    expect(response.status).toBe(304);
+    expect(response.headers.get("Last-Modified")).toBe("Mon, 08 Jun 2026 06:25:03 GMT");
+    expect(await response.text()).toBe("");
   });
 });
 
